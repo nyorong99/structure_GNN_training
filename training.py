@@ -90,7 +90,7 @@ def parse_args():
     p.add_argument("--num_layers_prot", type=int, default=4)
     p.add_argument("--num_layers_lig", type=int, default=4)
     p.add_argument("--num_layers_cross", type=int, default=2)
-    p.add_argument("--dropout", type=float, default=0.1)
+    p.add_argument("--dropout", type=float, default=0.2, help="Dropout rate (increased from 0.1 for regularization)")
     p.add_argument("--prot_in_dim", type=int, default=23)
     p.add_argument("--lig_in_dim", type=int, default=771)  # your npz currently uses 771
     p.add_argument("--use_priors", action="store_true", default=True)
@@ -99,11 +99,12 @@ def parse_args():
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--weight_decay", type=float, default=0.0)
+    p.add_argument("--weight_decay", type=float, default=1e-4, help="Weight decay for regularization (increased from 0.0)")
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--amp", action="store_true", default=True, help="Use AMP (bf16 if available else fp16)")
     p.add_argument("--val_interval", type=int, default=1)
     p.add_argument("--save_topk", type=int, default=3, help="Keep top-k checkpoints by Val RMSE (lower is better)")
+    p.add_argument("--early_stop_patience", type=int, default=30, help="Early stopping patience (epochs without improvement)")
     # Scheduler (simple cosine)
     p.add_argument("--use_cosine", action="store_true", default=True)
     p.add_argument("--cos_min_lr", type=float, default=1e-5)
@@ -210,6 +211,8 @@ def train_one_epoch(model, loader, optimizer, scaler, device, amp_enabled, grad_
     model.train()
     total_loss = 0.0
     total_n = 0
+    all_pred = []
+    all_y = []
 
     for batch in loader:
         y = batch["y"].to(device).squeeze(-1)  # (B,)
@@ -267,9 +270,23 @@ def train_one_epoch(model, loader, optimizer, scaler, device, amp_enabled, grad_
         bs = y.size(0)
         total_loss += float(loss.item()) * bs
         total_n += bs
+        
+        # Collect predictions for metrics (detach and move to CPU)
+        all_pred.append(pred.detach().cpu().float())
+        all_y.append(y.detach().cpu().float())
 
     avg_loss = total_loss / max(total_n, 1)
-    return avg_loss
+    
+    # Compute train metrics
+    if len(all_pred) > 0:
+        all_pred = torch.cat(all_pred, dim=0)
+        all_y = torch.cat(all_y, dim=0)
+        train_metrics = compute_metrics(all_pred, all_y)
+        train_metrics["loss"] = avg_loss
+    else:
+        train_metrics = {"loss": avg_loss, "rmse": float("nan"), "mae": float("nan"), "pearson": float("nan")}
+    
+    return train_metrics
 
 
 @torch.no_grad()
@@ -401,6 +418,7 @@ def main():
 
     best_rmse = float("inf")
     topk_paths = []
+    patience_counter = 0
 
     for epoch in range(1, args.epochs + 1):
         if ddp["use_ddp"]:
@@ -409,7 +427,7 @@ def main():
                 train_loader.sampler.set_epoch(epoch)
 
         # Train
-        train_loss = train_one_epoch(model, train_loader, optimizer, scaler, device, args.amp, args.grad_clip)
+        train_metrics = train_one_epoch(model, train_loader, optimizer, scaler, device, args.amp, args.grad_clip)
 
         # Scheduler step (epoch)
         if scheduler is not None:
@@ -418,15 +436,12 @@ def main():
         # Validate
         do_val = (val_loader is not None) and (epoch % args.val_interval == 0 or epoch == args.epochs)
         if do_val and is_rank0():
-            metrics = validate(model.module if ddp["use_ddp"] else model, val_loader, device)
-            cur_rmse = metrics["rmse"]
+            val_metrics = validate(model.module if ddp["use_ddp"] else model, val_loader, device)
+            cur_rmse = val_metrics["rmse"]
             print_log(
                 f"[Epoch {epoch:03d}] "
-                f"TrainLoss={train_loss:8.4f} | "
-                f"ValLoss={metrics['loss']:8.4f} | "
-                f"RMSE={metrics['rmse']:7.4f} | "
-                f"MAE={metrics['mae']:7.4f} | "
-                f"Pearson={metrics['pearson']:7.4f} | "
+                f"TrLoss={train_metrics['loss']:7.4f} TrRMSE={train_metrics['rmse']:6.4f} TrMAE={train_metrics['mae']:6.4f} TrR={train_metrics['pearson']:6.4f} | "
+                f"VaLoss={val_metrics['loss']:7.4f} VaRMSE={val_metrics['rmse']:6.4f} VaMAE={val_metrics['mae']:6.4f} VaR={val_metrics['pearson']:6.4f} | "
                 f"LR={optimizer.param_groups[0]['lr']: .2e}"
             )
 
@@ -434,6 +449,8 @@ def main():
             # Save checkpoint if improved
             if cur_rmse < best_rmse:
                 best_rmse = cur_rmse
+                patience_counter = 0  # Reset early stopping counter
+                print_log(f"✓ New best Val RMSE: {best_rmse:.4f}")
                 state = {
                     "epoch": epoch,
                     "model": (model.module if ddp['use_ddp'] else model).state_dict(),
@@ -458,9 +475,18 @@ def main():
                                 os.remove(fp)
                             except Exception:
                                 pass
+            else:
+                patience_counter += 1
+                if patience_counter >= args.early_stop_patience:
+                    print_log(f"Early stopping triggered after {patience_counter} epochs without improvement.")
+                    break
 
         elif is_rank0():
-            print_log(f"[Epoch {epoch:03d}] TrainLoss={train_loss:8.4f} | LR={optimizer.param_groups[0]['lr']: .2e}")
+            print_log(
+                f"[Epoch {epoch:03d}] "
+                f"TrLoss={train_metrics['loss']:7.4f} TrRMSE={train_metrics['rmse']:6.4f} TrMAE={train_metrics['mae']:6.4f} TrR={train_metrics['pearson']:6.4f} | "
+                f"LR={optimizer.param_groups[0]['lr']: .2e}"
+            )
 
     if is_rank0():
         print_log("Training completed.")
