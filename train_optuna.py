@@ -323,7 +323,7 @@ def objective(args, train_loader, val_loader, trial: optuna.Trial) -> float:
     # Sample hyperparameters
     trial_config = {
         "hidden_dim": trial.suggest_categorical("hidden_dim", [16, 32, 64]),
-        "dropout": trial.suggest_float("dropout", 0.0, 0.1, 0.3),
+        "dropout": trial.suggest_float("dropout", 0.0, 0.2),
         "lr": trial.suggest_float("lr", 1e-5, 1e-2, log=True),
         "weight_decay": trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True),
     }
@@ -442,4 +442,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
