@@ -162,17 +162,28 @@ class EGNNLayer(nn.Module):
 
         dist_ij = _rbf_distance(x_i, x_j)  # (E,1)
 
-        m_ij_input = torch.cat([h_i, h_j, edge_attr, dist_ij], dim=-1)  # (E, 2H+edge_dim+1)
+        #m_ij_input = torch.cat([h_i, h_j, edge_attr, dist_ij], dim=-1)  # (E, 2H+edge_dim+1)
+        # unify dtypes before cat
+        if edge_attr.dtype != h.dtype:
+            edge_attr = edge_attr.to(h.dtype)
+        if dist_ij.dtype != h.dtype:
+            dist_ij = dist_ij.to(h.dtype)
+        m_ij_input = torch.cat([h_i, h_j, edge_attr, dist_ij], dim=-1)
         m_ij = self.phi_e(m_ij_input)  # (E,H)
 
         # aggregate messages per dst node
         N = h.shape[0]
         agg = torch.zeros(N, self.hidden_dim, device=h.device, dtype=h.dtype)
+        # ensure dtype match under AMP (bf16/fp16)
+        if m_ij.dtype != h.dtype:
+            m_ij = m_ij.to(h.dtype)
         agg.index_add_(0, dst, m_ij)
 
         # feature update
         h_cat = torch.cat([h, agg], dim=-1)  # (N,2H)
         dh = self.phi_h(h_cat)
+        if dh.dtype != h.dtype:
+            dh = dh.to(h.dtype)
         h_out = self.norm_h(h + dh)
 
         # coordinate update
@@ -186,8 +197,12 @@ class EGNNLayer(nn.Module):
         coord_msg = direction_unit * gate_ij  # (E,3)
 
         dx = torch.zeros(N, 3, device=x.device, dtype=x.dtype)
+        if coord_msg.dtype != dx.dtype:
+            coord_msg = coord_msg.to(dx.dtype)
         dx.index_add_(0, dst, coord_msg)
 
+        if dx.dtype != x.dtype:
+            dx = dx.to(x.dtype)
         x_out = x + dx  # (N,3)
 
         return h_out, x_out
@@ -284,6 +299,10 @@ class _CrossLayer(nn.Module):
         p_feat = prot_h[prot_idx]  # (Ec,H)
         l_feat = lig_h[lig_idx]    # (Ec,H)
 
+        # unify dtypes before cat (AMP compatibility)
+        if cross_attr.dtype != prot_h.dtype:
+            cross_attr = cross_attr.to(prot_h.dtype)
+
         # messages to protein from ligand
         pl_in = torch.cat([p_feat, l_feat, cross_attr], dim=-1)  # (Ec,2H+edge_dim)
         m_pl = self.msg_pl(pl_in)  # (Ec,H)
@@ -295,11 +314,15 @@ class _CrossLayer(nn.Module):
         # aggregate per prot node
         Np = prot_h.shape[0]
         agg_p = torch.zeros(Np, self.hidden_dim, device=prot_h.device, dtype=prot_h.dtype)
+        if m_pl.dtype != prot_h.dtype:
+            m_pl = m_pl.to(prot_h.dtype)
         agg_p.index_add_(0, prot_idx, m_pl)
 
         # aggregate per lig node
         Nl = lig_h.shape[0]
         agg_l = torch.zeros(Nl, self.hidden_dim, device=lig_h.device, dtype=lig_h.dtype)
+        if m_lp.dtype != lig_h.dtype:
+            m_lp = m_lp.to(lig_h.dtype)
         agg_l.index_add_(0, lig_idx, m_lp)
 
         # update
@@ -308,6 +331,12 @@ class _CrossLayer(nn.Module):
 
         dp = self.upd_p(p_up_in)
         dl = self.upd_l(l_up_in)
+
+        # ensure dtype match for residual add
+        if dp.dtype != prot_h.dtype:
+            dp = dp.to(prot_h.dtype)
+        if dl.dtype != lig_h.dtype:
+            dl = dl.to(lig_h.dtype)
 
         prot_h_out = self.norm_p(prot_h + dp)
         lig_h_out = self.norm_l(lig_h + dl)
@@ -377,12 +406,18 @@ class ComplexReadout(nn.Module):
 
         prot_sum = torch.zeros(B, prot_h.size(-1), device=device, dtype=dtype)
         prot_cnt = torch.zeros(B, 1, device=device, dtype=dtype)
+        # ensure prot_h matches dtype for index_add_
+        if prot_h.dtype != dtype:
+            prot_h = prot_h.to(dtype)
         prot_sum.index_add_(0, prot_batch, prot_h)
         prot_cnt.index_add_(0, prot_batch, torch.ones_like(prot_batch, dtype=dtype).unsqueeze(-1))
         prot_pool = prot_sum / (prot_cnt.clamp(min=1.0))  # (B,H)
 
         lig_sum = torch.zeros(B, lig_h.size(-1), device=device, dtype=dtype)
         lig_cnt = torch.zeros(B, 1, device=device, dtype=dtype)
+        # ensure lig_h matches dtype for index_add_
+        if lig_h.dtype != dtype:
+            lig_h = lig_h.to(dtype)
         lig_sum.index_add_(0, lig_batch, lig_h)
         lig_cnt.index_add_(0, lig_batch, torch.ones_like(lig_batch, dtype=dtype).unsqueeze(-1))
         lig_pool = lig_sum / (lig_cnt.clamp(min=1.0))      # (B,H)
