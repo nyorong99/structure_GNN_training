@@ -15,6 +15,7 @@ This module:
 Author: yk + gpt
 """
 
+import os
 from dataclasses import dataclass
 from typing import Optional, Tuple, Dict
 import math
