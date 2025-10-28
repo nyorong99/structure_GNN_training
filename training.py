@@ -32,7 +32,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 from utils.logger import print_log, set_log_file, is_rank0
 from utils.random_seed import setup_seed
 from utils.cuda_utils import print_cuda_memory
-from utils.nn_utils import count_parameters
+from utils.nn_utils import count_parameters, compute_regression_metrics
 from utils.split_dataset import prepare_splits
 
 
@@ -167,30 +167,6 @@ def build_model(args, device):
     return model, cfg
 
 
-def compute_metrics(pred, y):
-    """Return dict with rmse, mae, pearson."""
-    # pred: (B,), y: (B,) or (B,1)
-    if y.ndim == 2 and y.size(-1) == 1:
-        y = y.squeeze(-1)
-
-    with torch.no_grad():
-        diff = pred - y
-        mse = torch.mean(diff * diff)
-        rmse = torch.sqrt(mse + 1e-12)
-        mae = torch.mean(torch.abs(diff))
-
-        # Pearson
-        x = pred - pred.mean()
-        yy = y - y.mean()
-        num = torch.sum(x * yy)
-        den = torch.sqrt(torch.sum(x * x) * torch.sum(yy * yy) + 1e-12)
-        pearson = num / den if den > 0 else torch.tensor(0.0, device=pred.device)
-
-    return {
-        "rmse": rmse.item(),
-        "mae": mae.item(),
-        "pearson": pearson.item(),
-    }
 
 
 def save_checkpoint(state: dict, save_dir: str, tag: str):
@@ -281,10 +257,10 @@ def train_one_epoch(model, loader, optimizer, scaler, device, amp_enabled, grad_
     if len(all_pred) > 0:
         all_pred = torch.cat(all_pred, dim=0)
         all_y = torch.cat(all_y, dim=0)
-        train_metrics = compute_metrics(all_pred, all_y)
+        train_metrics = compute_regression_metrics(all_pred, all_y)
         train_metrics["loss"] = avg_loss
     else:
-        train_metrics = {"loss": avg_loss, "rmse": float("nan"), "mae": float("nan"), "pearson": float("nan")}
+        train_metrics = {"loss": avg_loss, "rmse": float("nan"), "mae": float("nan"), "pearson": float("nan"), "r2": float("nan")}
     
     return train_metrics
 
@@ -327,12 +303,12 @@ def validate(model, loader, device):
         all_y.append(y.detach().cpu())
 
     if total_n == 0:
-        return {"loss": float("nan"), "rmse": float("nan"), "mae": float("nan"), "pearson": float("nan")}
+        return {"loss": float("nan"), "rmse": float("nan"), "mae": float("nan"), "pearson": float("nan"), "r2": float("nan")}
 
     all_pred = torch.cat(all_pred, dim=0)
     all_y = torch.cat(all_y, dim=0)
 
-    metrics = compute_metrics(all_pred, all_y)
+    metrics = compute_regression_metrics(all_pred, all_y)
     metrics["loss"] = total_loss / total_n
     return metrics
 
