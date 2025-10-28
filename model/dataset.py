@@ -1,50 +1,37 @@
-import os
-import json
-from typing import Any, Dict, List, Optional, Tuple
-
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+from typing import Any, Dict, List, Optional, Tuple
 
-
-def _to_float32(x: np.ndarray) -> torch.Tensor:
+def _to_float32(x):
     return torch.as_tensor(x, dtype=torch.float32)
 
-
-def _to_int64(x: np.ndarray) -> torch.Tensor:
+def _to_int64(x):
     return torch.as_tensor(x, dtype=torch.int64)
 
-
 class PoseDataset(Dataset):
-    """
-    Load per-pose .npz graphs and expose tensors for training.
-
-    Index JSONL format (flexible keys supported):
-      - npz_path or path: string path to .npz
-      - entry_id: string
-      - pose_idx: int
-      - all_passed: optional {0,1}
-
-    filter_all_passed:
-      - None  -> use all
-      - True  -> keep only all_passed==1
-      - False -> keep only all_passed==0
-    """
-
-    def __init__(self, index_file: str, filter_all_passed: Optional[bool] = None) -> None:
+    def __init__(self, index_file: str, filter_all_passed=None):
         assert os.path.exists(index_file), f"Index not found: {index_file}"
-        self.records: List[Dict[str, Any]] = []
+        self.records = []
+
+        index_dir = os.path.dirname(os.path.abspath(index_file))
+
         with open(index_file, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line:
                     continue
                 obj = json.loads(line)
-                # normalize keys
+
                 npz_path = obj.get("npz_path") or obj.get("path") or obj.get("npz")
                 if npz_path is None:
-                    # Skip malformed entries silently
                     continue
+
+                #
+                if not os.path.isabs(npz_path):
+                    npz_path = os.path.join(index_dir, npz_path)
+                npz_path = os.path.abspath(npz_path)
+
                 rec = {
                     "npz_path": npz_path,
                     "entry_id": obj.get("entry_id", ""),
@@ -57,16 +44,17 @@ class PoseDataset(Dataset):
             want = 1 if filter_all_passed else 0
             self.records = [r for r in self.records if r.get("all_passed", 1) == want]
 
-    def __len__(self) -> int:
+    def __len__(self):
         return len(self.records)
 
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
+    def __getitem__(self, idx: int):
         rec = self.records[idx]
-        path = rec["npz_path"]
-        # Note: In DDP, non-rank0 workers may hit this; consider try/except or rank-aware skipping
+        path = rec["npz_path"]  #
+
         if not os.path.exists(path):
             raise FileNotFoundError(f"NPZ not found: {path}")
-        # structured dtype일 경우 pickle=True로 바꿀 수 있음
+
+        
         data = np.load(path, allow_pickle=False)
 
         # Map file keys -> standardized output keys per spec
